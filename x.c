@@ -1596,8 +1596,67 @@ xdrawline(Line line, int x1, int y1, int x2)
 }
 
 void
+delete_image(ImageList *im)
+{
+	if (im->prev)
+		im->prev->next = im->next;
+	else
+		term.images = im->next;
+	if (im->next)
+		im->next->prev = im->prev;
+	if (im->pixmap)
+		XFreePixmap(xw.dpy, (Drawable)im->pixmap);
+	free(im->pixels);
+	free(im);
+}
+
+void
 xfinishdraw(void)
 {
+	ImageList *im, *next;
+	XGCValues gcvalues;
+	GC gc;
+
+	for (im = term.images; im; im = next) {
+		/* get the next image here, because delete_image() will delete the current image */
+		next = im->next;
+
+		if (im->should_delete) {
+			delete_image(im);
+			continue;
+		}
+
+		if (!im->pixmap) {
+			im->pixmap = (void *)XCreatePixmap(xw.dpy, xw.win, im->width, im->height,
+				DefaultDepth(xw.dpy, xw.scr)
+			);
+			XImage ximage = {
+				.format = ZPixmap,
+				.data = (char *)im->pixels,
+				.width = im->width,
+				.height = im->height,
+				.xoffset = 0,
+				.byte_order = LSBFirst,
+				.bitmap_bit_order = MSBFirst,
+				.bits_per_pixel = 32,
+				.bytes_per_line = im->width * 4,
+				.bitmap_unit = 32,
+				.bitmap_pad = 32,
+				.depth = 24
+			};
+			XPutImage(xw.dpy, (Drawable)im->pixmap, dc.gc, &ximage, 0, 0, 0, 0, im->width, im->height);
+			free(im->pixels);
+			im->pixels = NULL;
+		}
+
+		memset(&gcvalues, 0, sizeof(gcvalues));
+		gcvalues.graphics_exposures = False;
+		gc = XCreateGC(xw.dpy, xw.win, GCGraphicsExposures, &gcvalues);
+
+		XCopyArea(xw.dpy, (Drawable)im->pixmap, xw.buf, gc, 0, 0, im->width, im->height, win.hborderpx + im->x * win.cw, win.vborderpx + im->y * win.ch);
+		XFreeGC(xw.dpy, gc);
+
+	}
 	XCopyArea(xw.dpy, xw.buf, xw.win, dc.gc, 0, 0, win.w,
 			win.h, 0, 0);
 	XSetForeground(xw.dpy, dc.gc,

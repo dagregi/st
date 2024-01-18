@@ -143,6 +143,8 @@ typedef struct {
 	int charset;  /* current charset */
 	int icharset; /* selected charset for sequence */
 	int *tabs;
+	ImageList *images;     /* sixel images */
+	ImageList *images_alt; /* sixel images for alternate screen */
 	Rune lastc;   /* last printed char outside of sequence, 0 if control */
 } Term;
 
@@ -249,6 +251,9 @@ void redraw(void);
 void draw(void);
 void drawregion(int, int, int, int);
 void tfulldirt(void);
+
+static void dcshandle(void);
+static void scroll_images(int n);
 
 void printscreen(const Arg *);
 void printsel(const Arg *);

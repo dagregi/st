@@ -19,6 +19,7 @@
 
 #include "st.h"
 #include "win.h"
+#include "sixel.h"
 
 #if   defined(__linux)
  #include <pty.h>
@@ -55,6 +56,7 @@ enum term_mode {
 	MODE_ECHO        = 1 << 4,
 	MODE_PRINT       = 1 << 5,
 	MODE_UTF8        = 1 << 6,
+	MODE_SIXEL       = 1 << 7,
 };
 
 enum cursor_movement {
@@ -86,6 +88,7 @@ enum escape_state {
 	ESC_STR_END    = 16, /* a final string was encountered */
 	ESC_TEST       = 32, /* Enter in test mode */
 	ESC_UTF8       = 64,
+	ESC_DCS        =128,
 };
 
 typedef struct {
@@ -201,6 +204,7 @@ static STREscape strescseq;
 static int iofd = 1;
 static int cmdfd;
 static pid_t pid;
+sixel_state_t sixel_st;
 
 static const uchar utfbyte[UTF_SIZ + 1] = {0x80,    0, 0xC0, 0xE0, 0xF0};
 static const uchar utfmask[UTF_SIZ + 1] = {0xC0, 0x80, 0xE0, 0xF0, 0xF8};
@@ -990,6 +994,7 @@ void
 treset(void)
 {
 	int i, j;
+	ImageList *im;
 	Glyph g = (Glyph){ .fg = defaultfg, .bg = defaultbg};
 
 	memset(term.tabs, 0, term.col * sizeof(*term.tabs));
@@ -1018,6 +1023,9 @@ treset(void)
 			term.screen[i].buffer[j] = NULL;
 		}
 	}
+	for (im = term.images; im; im = im->next)
+		im->should_delete = 1;
+
 	tcursor(CURSOR_LOAD);
 	term.linelen = term.col;
 	tfulldirt();
@@ -1040,6 +1048,10 @@ tnew(int col, int row)
 void
 tswapscreen(void)
 {
+	ImageList *im = term.images;
+
+	term.images = term.images_alt;
+	term.images_alt = im;
 	term.mode ^= MODE_ALTSCREEN;
 	tfulldirt();
 }
@@ -1077,6 +1089,62 @@ kscrolldown(const Arg *a)
 }
 
 void
+dcshandle(void)
+{
+	int bgcolor;
+	unsigned char r, g, b, a = 255;
+
+	switch (csiescseq.mode[0]) {
+	default:
+		fprintf(stderr, "erresc: unknown csi ");
+		csidump();
+		/* die(""); */
+		break;
+	case 'q': /* DECSIXEL */
+		if (IS_TRUECOL(term.c.attr.bg)) {
+			r = term.c.attr.bg >> 16 & 255;
+			g = term.c.attr.bg >> 8 & 255;
+			b = term.c.attr.bg >> 0 & 255;
+		} else {
+			xgetcolor(term.c.attr.bg, &r, &g, &b);
+			#if ALPHA_PATCH
+			if (term.c.attr.bg == defaultbg)
+				a = dc.col[defaultbg].pixel >> 24 & 255;
+			#endif // ALPHA_PATCH
+		}
+		bgcolor = a << 24 | b << 16 | g << 8 | r;
+		if (sixel_parser_init(&sixel_st, 255 << 24, bgcolor, 1, win.cw, win.ch) != 0)
+			perror("sixel_parser_init() failed");
+		term.mode |= MODE_SIXEL;
+		break;
+	}
+}
+
+void
+scroll_images(int n) {
+	ImageList *im;
+	int tmp;
+
+	/* maximum sixel distance in lines from current view before
+	 * deallocation
+	 * TODO: should be in config.h */
+	int max_sixel_distance = 10000;
+
+	for (im = term.images; im; im = im->next) {
+		im->y += n;
+
+		/* check if the current sixel has exceeded the maximum
+		 * draw distance, and should therefore be deleted */
+		tmp = im->y;
+		if (tmp < 0) { tmp = tmp * -1; }
+		if (tmp > max_sixel_distance) {
+			fprintf(stderr, "im@0x%08x exceeded maximum distance\n");
+			im->should_delete = 1;
+		}
+	}
+}
+
+void
 tscrolldown(int orig, int n)
 {
 	int i;
@@ -1099,6 +1167,15 @@ tscrolldown(int orig, int n)
 		temp = TLINE(i);
 		TLINE(i) = TLINE(i-n);
 		TLINE(i-n) = temp;
+	}
+
+	/* move images, if they are inside the scrolling region */
+	ImageList *im;
+	for (im = term.images; im; im = im->next) {
+		if (im->y * win.ch + im->height > orig * win.ch && im->y <= term.bot) {
+			im->y += n;
+			im->should_delete |= (im->y >= term.row);
+		}
 	}
 
 	/* Scroll buffer */
@@ -1134,6 +1211,8 @@ tscrollup(int orig, int n)
 		TLINE(i) = TLINE(i+n);
 		TLINE(i+n) = temp;
 	}
+
+	scroll_images(-1 * n);
 
 	/* Scroll buffer */
 	TSCREEN.cur = (TSCREEN.cur + n) % TSCREEN.size;
@@ -1654,6 +1733,7 @@ csihandle(void)
 {
 	char buf[40];
 	int len;
+	ImageList *im;
 
 	switch (csiescseq.mode[0]) {
 	default:
@@ -1761,9 +1841,22 @@ csihandle(void)
 			if (term.c.y > 1)
 				tclearregion(0, 0, term.col-1, term.c.y-1);
 			tclearregion(0, term.c.y, term.c.x, term.c.y);
+
+			for (im = term.images; im; im = im->next)
+				im->should_delete = 1;
 			break;
 		case 2: /* all */
 			tclearregion(0, 0, term.col-1, term.row-1);
+			break;
+		case 3:
+			if (!IS_SET(MODE_ALTSCREEN)) {
+				for (im = term.images; im; im = im->next)
+					im->should_delete |= (im->y * win.ch + im->height <= 0);
+			}
+			break;
+		case 6: /* sixels */
+			for (im = term.images; im; im = im->next)
+				im->should_delete = 1;
 			break;
 		default:
 			goto unknown;
@@ -1797,6 +1890,10 @@ csihandle(void)
 		break;
 	case 'l': /* RM -- Reset Mode */
 		tsetmode(csiescseq.priv, 0, csiescseq.arg, csiescseq.narg);
+		if (IS_SET(MODE_ALTSCREEN)) {
+			for (im = term.images; im; im = im->next)
+				im->should_delete = 1;
+		}
 		break;
 	case 'M': /* DL -- Delete <n> lines */
 		DEFAULT(csiescseq.arg[0], 1);
@@ -1921,6 +2018,8 @@ strhandle(void)
 {
 	char *p = NULL, *dec;
 	int j, narg, par;
+	ImageList *new_image;
+	int i;
 	const struct { int idx; char *str; } osc_table[] = {
 		{ defaultfg, "foreground" },
 		{ defaultbg, "background" },
@@ -2006,6 +2105,39 @@ strhandle(void)
 		xsettitle(strescseq.args[0]);
 		return;
 	case 'P': /* DCS -- Device Control String */
+		if (IS_SET(MODE_SIXEL)) {
+			term.mode &= ~MODE_SIXEL;
+			new_image = malloc(sizeof(ImageList));
+			memset(new_image, 0, sizeof(ImageList));
+			if (sixel_parser_finalize(&sixel_st, &new_image->pixels) != 0) {
+				perror("sixel_parser_finalize() failed");
+				sixel_parser_deinit(&sixel_st);
+				free(new_image);
+				return;
+			}
+			new_image->x = term.c.x;
+			new_image->y = term.c.y;
+			new_image->width = sixel_st.image.width;
+			new_image->height = sixel_st.image.height;
+			sixel_parser_deinit(&sixel_st);
+			if (term.images) {
+				ImageList *im;
+				for (im = term.images; im->next;)
+					im = im->next;
+				im->next = new_image;
+				new_image->prev = im;
+			} else {
+				term.images = new_image;
+			}
+			for (i = 0; i < (sixel_st.image.height + win.ch-1)/win.ch; ++i) {
+				int x;
+				tclearregion(term.c.x, term.c.y, term.c.x+(sixel_st.image.width+win.cw-1)/win.cw-1, term.c.y);
+				for (x = term.c.x; x < MIN(term.col, term.c.x+(sixel_st.image.width+win.cw-1)/win.cw); x++)
+					TLINE(term.c.y)[x].mode |= ATTR_SIXEL;
+				tnewline(0);
+			}
+		}
+		return;
 	case '_': /* APC -- Application Program Command */
 	case '^': /* PM -- Privacy Message */
 		return;
@@ -2199,9 +2331,12 @@ tdectest(char c)
 void
 tstrsequence(uchar c)
 {
+	strreset();
+
 	switch (c) {
 	case 0x90:   /* DCS -- Device Control String */
 		c = 'P';
+		term.esc |= ESC_DCS;
 		break;
 	case 0x9f:   /* APC -- Application Program Command */
 		c = '_';
@@ -2333,6 +2468,7 @@ eschandle(uchar ascii)
 		term.esc |= ESC_UTF8;
 		return 0;
 	case 'P': /* DCS -- Device Control String */
+		term.esc |= ESC_DCS;
 	case '_': /* APC -- Application Program Command */
 	case '^': /* PM -- Privacy Message */
 	case ']': /* OSC -- Operating System Command */
@@ -2411,7 +2547,7 @@ tputc(Rune u)
 	Glyph *gp;
 
 	control = ISCONTROL(u);
-	if (u < 127 || !IS_SET(MODE_UTF8)) {
+	if (u < 127 || !IS_SET(MODE_UTF8 | MODE_SIXEL)) {
 		c[0] = u;
 		width = len = 1;
 	} else {
@@ -2432,10 +2568,18 @@ tputc(Rune u)
 	if (term.esc & ESC_STR) {
 		if (u == '\a' || u == 030 || u == 032 || u == 033 ||
 		   ISCONTROLC1(u)) {
-			term.esc &= ~(ESC_START|ESC_STR);
+			term.esc &= ~(ESC_START|ESC_STR|ESC_DCS);
 			term.esc |= ESC_STR_END;
 			goto check_control_code;
 		}
+
+		if (IS_SET(MODE_SIXEL)) {
+			if (sixel_parser_parse(&sixel_st, (unsigned char *)&u, 1) != 0)
+				perror("sixel_parser_parse() failed");
+			return;
+		}
+		if (term.esc & ESC_DCS)
+			goto check_control_code;
 
 		if (strescseq.len+len >= strescseq.siz) {
 			/*
@@ -2485,6 +2629,15 @@ check_control_code:
 				term.esc = 0;
 				csiparse();
 				csihandle();
+			}
+			return;
+		} else if (term.esc & ESC_DCS) {
+			csiescseq.buf[csiescseq.len++] = u;
+			if (BETWEEN(u, 0x40, 0x7E)
+					|| csiescseq.len >= \
+					sizeof(csiescseq.buf)-1) {
+				csiparse();
+				dcshandle();
 			}
 			return;
 		} else if (term.esc & ESC_UTF8) {
@@ -2557,7 +2710,7 @@ twrite(const char *buf, int buflen, int show_ctrl)
 	}
 
 	for (n = 0; n < buflen; n += charsize) {
-		if (IS_SET(MODE_UTF8)) {
+		if (IS_SET(MODE_UTF8) && !IS_SET(MODE_SIXEL)) {
 			/* process a complete utf8 char */
 			charsize = utf8decode(buf + n, &u, buflen - n);
 			if (charsize == 0)
