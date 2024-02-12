@@ -18,7 +18,7 @@ sudo make install
 
 Defaults configuration are stored in `config.def.h`. Edit it according to your needs. 
 
-## Patches:
+## Patches
 
 - [anysize](https://st.suckless.org/patches/anysize/)
 - [boxdraw](https://st.suckless.org/patches/boxdraw/)
@@ -37,11 +37,7 @@ xrdb -merge path/to/xresources
 pkill -USR1 st
 ```
 
-## Themes/Fonts used
-
-- Font: [JetbrainsMono Nerd Font](https://www.nerdfonts.com/font-downloads)
-- Theme: [RoséPine](https://rosepinetheme.com)
-
 # Credits
 
+- Theme: [RoséPine](https://rosepinetheme.com)
 - [sixel support](https://github.com/bakkeby/st-flexipatch)
